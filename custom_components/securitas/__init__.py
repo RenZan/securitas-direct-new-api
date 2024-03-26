@@ -23,58 +23,60 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import DeviceInfo
 
-from .securitas_direct_new_api.apimanager import (
+from .securitas_direct_new_api import (
+    ApiDomains,
     ApiManager,
-    generate_device_id,
-    generate_uuid,
-)
-from .securitas_direct_new_api.dataTypes import (
     CheckAlarmStatus,
+    CommandType,
     Installation,
-    OtpPhone,
-    Service,
-    SStatus,
-)
-from .securitas_direct_new_api.exceptions import (
     Login2FAError,
     LoginError,
+    OtpPhone,
     SecuritasDirectError,
+    Service,
+    SStatus,
+    generate_device_id,
+    generate_uuid,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-CONF_ALARM = "alarm"  # FIXME unused
+DOMAIN = "securitas"
+
 CONF_COUNTRY = "country"
 CONF_CHECK_ALARM_PANEL = "check_alarm_panel"
+CONF_USE_2FA = "use_2FA"
+CONF_PERI_ALARM = "PERI_alarm"
 CONF_DEVICE_INDIGITALL = "idDeviceIndigitall"
 CONF_ENTRY_ID = "entry_id"
 CONF_INSTALLATION_KEY = "instalation"
-CONF_ENABLE_CODE = "enable_code"
 CONF_DELAY_CHECK_OPERATION = "delay_check_operation"
-DOMAIN = "securitas"
-MIN_SCAN_INTERVAL = 20  # FIXME: unused?
+
+DEFAULT_USE_2FA = True
 DEFAULT_SCAN_INTERVAL = 120
 DEFAULT_CHECK_ALARM_PANEL = True
 DEFAULT_DELAY_CHECK_OPERATION = 2
 DEFAULT_CODE = ""
-DEFAULT_CODE_ENABLED = True
+DEFAULT_PERI_ALARM = False
 
 
 PLATFORMS = [Platform.ALARM_CONTROL_PANEL, Platform.SENSOR]
 HUB = None
 
+ATTR_INSTALLATION_ID = "instalation_id"
+SERVICE_REFRESH_INSTALLATION = "refresh_alarm_status"
+
+
 CONFIG_SCHEMA = vol.Schema(
     {
         DOMAIN: vol.Schema(
             {
-                vol.Required(
-                    CONF_USERNAME,
-                ): str,
-                vol.Required(
-                    CONF_PASSWORD,
-                ): str,
+                vol.Required(CONF_USERNAME): str,
+                vol.Required(CONF_PASSWORD): str,
+                vol.Optional(CONF_USE_2FA, default=DEFAULT_USE_2FA): bool,
                 vol.Optional(CONF_COUNTRY, default="ES"): str,
                 vol.Optional(CONF_CODE, default=DEFAULT_CODE): str,
+                vol.Optional(CONF_PERI_ALARM, default=DEFAULT_PERI_ALARM): bool,
                 vol.Optional(
                     CONF_CHECK_ALARM_PANEL, default=DEFAULT_CHECK_ALARM_PANEL
                 ): bool,
@@ -84,9 +86,6 @@ CONFIG_SCHEMA = vol.Schema(
     },
     extra=vol.ALLOW_EXTRA,
 )
-
-ATTR_INSTALLATION_ID = "instalation_id"
-SERVICE_REFRESH_INSTALLATION = "refresh_alarm_status"
 
 REFRESH_ALARM_STATUS_SCHEMA = vol.Schema(
     {
@@ -116,7 +115,6 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
     if any(
         entry.data.get(attrib) != entry.options.get(attrib)
         for attrib in (
-            CONF_ENABLE_CODE,
             CONF_CODE,
             CONF_SCAN_INTERVAL,
             CONF_CHECK_ALARM_PANEL,
@@ -129,14 +127,6 @@ async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await hass.config_entries.async_reload(entry.entry_id)
 
 
-def merge_configuration(items: OrderedDict, entry: ConfigEntry) -> OrderedDict:
-    if entry.data[CONF_CODE] != items[CONF_CODE]:
-        items[CONF_CODE] = entry.data[CONF_CODE]
-
-    if entry.data[CONF_SCAN_INTERVAL] != items[CONF_SCAN_INTERVAL]:
-        items[CONF_SCAN_INTERVAL] = entry.data[CONF_SCAN_INTERVAL]
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Establish connection with Securitas Direct."""
     need_sign_in: bool = False
@@ -144,19 +134,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     config = OrderedDict()
     config[CONF_USERNAME] = entry.data[CONF_USERNAME]
     config[CONF_PASSWORD] = entry.data[CONF_PASSWORD]
-    config[CONF_COUNTRY] = entry.data[CONF_COUNTRY]
-    config[CONF_CODE] = entry.data.get(CONF_CODE, None)
-    config[CONF_CHECK_ALARM_PANEL] = entry.data[CONF_CHECK_ALARM_PANEL]
+    config[CONF_USE_2FA] = entry.data.get(CONF_USE_2FA, DEFAULT_USE_2FA)
+    config[CONF_COUNTRY] = entry.data.get(CONF_COUNTRY, None)
+    config[CONF_CODE] = entry.data.get(CONF_CODE, DEFAULT_CODE)
+    config[CONF_PERI_ALARM] = entry.data.get(CONF_PERI_ALARM, DEFAULT_PERI_ALARM)
+    config[CONF_CHECK_ALARM_PANEL] = entry.data.get(
+        CONF_CHECK_ALARM_PANEL, DEFAULT_CHECK_ALARM_PANEL
+    )
     config[CONF_SCAN_INTERVAL] = entry.data.get(
         CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
     )
-    # was 60
     config[CONF_DELAY_CHECK_OPERATION] = entry.data.get(
         CONF_DELAY_CHECK_OPERATION, DEFAULT_DELAY_CHECK_OPERATION
     )
     config[CONF_ENTRY_ID] = entry.entry_id
     config = add_device_information(config)
-    # config = merge_configuration(config, entry)
     if CONF_DEVICE_ID in entry.data:
         config[CONF_DEVICE_ID] = entry.data[CONF_DEVICE_ID]
     else:
@@ -193,12 +185,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
             )
             return False
-        except LoginError:
-            _LOGGER.error("Could not log in to Securitas")
+        except LoginError as err:
+            _LOGGER.error("Could not log in to Securitas %s", err.args)
+        except SecuritasDirectError as err:
+            _LOGGER.error("Could not log in to Securitas %s", err.args)
         else:
             hass.data[DOMAIN][SecuritasHub.__name__] = client
             installations: list[
-                SecuritasDirectDevice
+                Installation
             ] = await client.session.list_installations()
             devices: list[SecuritasDirectDevice] = []
             for installation in installations:
@@ -215,7 +209,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         config = add_device_information(entry.data.copy())
         config[CONF_SCAN_INTERVAL] = entry.data.get(
             CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
-        )  # was 60
+        )
         hass.async_create_task(
             hass.config_entries.flow.async_init(
                 DOMAIN, context={"source": SOURCE_IMPORT}, data=config
@@ -324,7 +318,7 @@ class SecuritasHub:
     def __init__(
         self,
         domain_config: OrderedDict,
-        config_entry: ConfigEntry,  # FIXME: this is never used
+        config_entry: ConfigEntry,
         http_client: ClientSession,
         hass: HomeAssistant,
     ) -> None:
@@ -335,18 +329,21 @@ class SecuritasHub:
         self.sentinel_services: list[Service] = []
         self.check_alarm: bool = domain_config[CONF_CHECK_ALARM_PANEL]
         self.country: str = domain_config[CONF_COUNTRY].upper()
-        self.lang: str = self.country.lower() if self.country != "UK" else "en"
+        self.lang: str = ApiDomains().get_language(self.country)
         self.hass: HomeAssistant = hass
         self.services: dict[int, list[Service]] = {1: []}
+        self.command_type: CommandType = (
+            CommandType.PERI if domain_config[CONF_PERI_ALARM] else CommandType.STD
+        )
         self.session: ApiManager = ApiManager(
             domain_config[CONF_USERNAME],
             domain_config[CONF_PASSWORD],
             self.country,
-            self.lang,
             http_client,
             domain_config[CONF_DEVICE_ID],
             domain_config[CONF_UNIQUE_ID],
             domain_config[CONF_DEVICE_INDIGITALL],
+            self.command_type,
             domain_config[CONF_DELAY_CHECK_OPERATION],
         )
         self.installations: list[Installation] = []
@@ -365,11 +362,11 @@ class SecuritasHub:
         """Send the SMS."""
         return await self.session.validate_device(True, auth_otp_hash, sms_code)
 
-    async def refresh_token(self) -> tuple[str, list[OtpPhone]]:
+    async def refresh_token(self) -> bool:
         """Refresh the token."""
         return await self.session.refresh_token()
 
-    async def sent_opt(self, challange: str, phone_index: int):
+    async def send_opt(self, challange: str, phone_index: int):
         """Call for the SMS challange."""
         return await self.session.send_otp(phone_index, challange)
 
@@ -397,15 +394,15 @@ class SecuritasHub:
         """Update the overview."""
 
         if self.check_alarm is not True:
+            status: SStatus = SStatus()
             try:
-                status: SStatus = await self.session.check_general_status(installation)
+                status = await self.session.check_general_status(installation)
             except SecuritasDirectError as err:
                 _LOGGER.info(err.args)
-                return None
 
             return CheckAlarmStatus(
                 status.status,
-                None,
+                "",
                 status.status,
                 installation.number,
                 status.status,
@@ -421,7 +418,6 @@ class SecuritasHub:
             )
         except SecuritasDirectError as err:
             _LOGGER.error(err.args)
-            return None
 
         return alarm_status
 
